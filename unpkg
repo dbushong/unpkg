@@ -1,0 +1,142 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Getopt::Std;
+use File::Basename;
+use File::Path;
+
+my $prog = basename($0);
+my %opt;
+getopts('hRMUn:i:', \%opt);
+
+die <<EOF if $opt{h} || !@ARGV;
+usage: $prog [-R] [-M] [-U] [-n nice-level] file [file [...]]
+       -R: don't remove original(s)
+       -M: don't remove __MACOSX dir
+       -U: don't ignore .url file at the top-level
+       -n: specify nice level (default 20)
+       -i: specify ionice class 2 level (default 7)
+EOF
+$opt{n} = 20 unless ($opt{n} || '') =~ /^[+-]\d+$/;
+$opt{i} = 7  unless ($opt{i} || '') =~ /^\d+$/;
+
+$opt{n} = "+$opt{n}" if $opt{n} && $opt{n} !~ /^[+-]/;
+system('renice', $opt{n}, $$) if $opt{n};
+system('ionice', '-c2', "-n$opt{i}", "-p$$");
+
+for my $pkg (@ARGV) {
+  my $file = basename($pkg);
+  my $rm   = ($file !~ /\.part$/);
+  my $base = $file;
+  $base =~ s/\.(zip|xpi|jar|7z|tar(\.(gz|bz2))?|t[bg]z|rar|cbr)(\.part)?$//i;
+  if ($file eq $base) { # no extension(s) removed
+    my $infer = `file \Q$pkg\E 2>&1`;
+    # TODO: add more
+    if ($infer =~ /: Zip archive data/) {
+      $file .= '.zip';
+    }
+    else {
+      die "$prog: unknown archive type\n";
+    }
+  }
+  my $dir = unique_file($base);
+  mkdir($dir);
+  chdir($dir);
+  my $tmp = "$base-tmp-$$-" . time();
+
+  my $fail;
+  $pkg = "../$pkg" unless $pkg =~ m{^/};
+  if ($file =~ /\.zip\.part$/i) {
+    system('cp', $pkg, $tmp);
+    system('zip', '-qF', $tmp);
+    system('unzip', $tmp);
+    unlink($tmp);
+  }
+  elsif ($file =~ /\.(zip|xpi|jar)$/i) {
+    $fail = system('unzip', $pkg);
+  }
+  elsif ($file =~ /\.(cbr|rar)\.part$/i) {
+    $fail = system('unrar', '-kb', 'x', $pkg);
+  }
+  elsif ($file =~ /\.(cbr|rar)$/i) {
+    $fail = system('unrar', 'x', $pkg);
+  }
+  elsif ($file =~ /\.7z$/i) {
+    $fail = system('7zr', 'x', $pkg);
+  }
+  elsif ($file =~ /\.(tgz|tar\.gz)(\.part)?$/i) {
+    $fail = system('tar', 'zxf', $pkg);
+  }
+  elsif ($file =~ /\.(tbz|tar\.bz2)(\.part)?$/i) {
+    $fail = system('tar', 'jxf', $pkg);
+  }
+  elsif ($file =~ /\.tar$/i) {
+    $fail = system('tar', 'xf', $pkg);
+  }
+  else {
+    warn "$prog: unknown archive type\n";
+    $fail = 1;
+  }
+
+  if ($fail) {
+    warn "$prog: failed to unpkg $pkg; skipping\n";
+    chdir('..');
+    rmdir($dir);
+    next;
+  }
+
+  if ($rm && !$opt{R}) {
+    if ($pkg =~ /\.part1\.(rar|cbr)$/i) {
+      my $glob = quotemeta($pkg);
+      $glob =~ s/\\\.part1\\\.(rar|cbr)$/.*.$1/i;
+      unlink(glob($glob));
+    }
+    else {
+      unlink($pkg);
+    }
+  }
+
+  opendir(my $dh, '.');
+  my @extracted = grep(!/^\.\.?$/, readdir($dh));
+  closedir($dh);
+
+  my ($ufile) = grep(/\.url$/i, @extracted);
+  if ($ufile) {
+    unlink($ufile);
+    @extracted = grep(!/\.url$/i, @extracted);
+  }
+
+  chdir('..');
+
+  if (!$opt{M} && -d "$dir/__MACOSX") {
+    rmtree("$dir/__MACOSX");
+    @extracted = grep(!/^__MACOSX$/, @extracted);
+  }
+
+  if (@extracted == 1) {
+    my $ex = $extracted[0];
+    if ($ex eq $dir) {
+      rename($dir, $tmp);
+      rename("$tmp/$ex", $ex);
+      rmdir($tmp);
+    }
+    else {
+      rename("$dir/$ex", $ex);
+      rmdir($dir);
+    }
+    $dir = $ex;
+  }
+
+  print "$pkg -> $dir\n";
+}
+
+sub unique_file {
+  my ($base) = @_;
+  my $n    = 2;
+  my $name = $base;
+  while (-e $name) {
+    $name = $base . $n++; 
+  }
+  return $name;
+}
